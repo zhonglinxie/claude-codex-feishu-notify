@@ -226,23 +226,41 @@ def _read_last_assistant_from_transcript(transcript_path: str) -> str:
     assistant messages until the next user message. We collect all text blocks from assistant
     messages in the last turn.
 
-    Retries with increasing delay because Stop hook fires before transcript is fully written.
+    Waits for transcript to have new content by monitoring file size changes.
     """
     path = Path(transcript_path)
     if not path.exists():
         LOGGER.warning("transcript_not_found path=%s", transcript_path)
         return ""
 
-    # Retry a few times with increasing delay
-    for attempt in range(4):
-        time.sleep(1.5 + attempt * 0.5)  # 1.5s, 2s, 2.5s, 3s
+    # Get initial file size
+    initial_size = path.stat().st_size
+    initial_lines = len(path.read_text(encoding="utf-8").strip().split("\n"))
+    LOGGER.info("transcript_initial size=%d lines=%d", initial_size, initial_lines)
 
+    # Wait for file to grow (new content written)
+    max_wait = 8.0  # seconds
+    poll_interval = 0.3
+    waited = 0.0
+    while waited < max_wait:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        current_size = path.stat().st_size
+        if current_size > initial_size:
+            LOGGER.info("transcript_grew after=%.1fs old_size=%d new_size=%d", waited, initial_size, current_size)
+            # Give a tiny bit more time for write to complete
+            time.sleep(0.2)
+            break
+
+    # Now try to parse
+    for attempt in range(3):
         try:
             result = _parse_transcript_for_last_turn(path, attempt + 1)
             if result:
                 return result
         except Exception as e:
             LOGGER.warning("transcript_parse_error attempt=%d error=%r", attempt + 1, e)
+        time.sleep(0.5)
 
     LOGGER.info("no_text_after_retries path=%s", transcript_path)
     return ""
@@ -313,30 +331,6 @@ def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
                             all_text_parts.append(block.strip())
             elif isinstance(content, str) and content.strip():
                 all_text_parts.append(content.strip())
-
-    # If no text found after user message, search backwards for any recent assistant text
-    # This handles the case where Stop hook fires before final message is written
-    if not all_text_parts:
-        LOGGER.info("no_text_after_user_msg, searching backwards from_idx=%d", last_user_idx)
-        for i in range(last_user_idx - 1, max(0, last_user_idx - 50), -1):
-            line = lines[i].strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if entry.get("type") == "assistant":
-                message = entry.get("message", {})
-                content = message.get("content", [])
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                LOGGER.info("found_previous_assistant_text at_idx=%d len=%d", i, len(text))
-                                return text
 
     if all_text_parts:
         result = "\n\n".join(all_text_parts)
