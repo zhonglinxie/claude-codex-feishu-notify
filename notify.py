@@ -6,6 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import socket
 import sys
 import time
 import traceback
@@ -387,6 +388,16 @@ def main():
     title = ""
     message = ""
 
+    # Get context info for prefix
+    username = os.getenv("USER", os.getenv("USERNAME", "unknown"))
+    hostname = socket.gethostname()
+    cwd = notification.get("cwd", os.getcwd())
+    # Shorten home directory
+    home = os.path.expanduser("~")
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+    context_prefix = "[%s@%s %s]" % (username, hostname, cwd)
+
     thread_id = _get_thread_id(notification)
     LOGGER.info(
         "notify_received type=%r hook_event=%r normalized=%r thread_id=%r env={APP_ID:%s,APP_SECRET:%s,USER_ID:%s} argv_len=%d raw_len=%d",
@@ -416,9 +427,9 @@ def main():
                 if len(assistant_message) > 1500
                 else assistant_message
             )
-            title = "Codex: %s" % short_msg
+            title = "%s Codex:\n%s" % (context_prefix, short_msg)
         else:
-            title = "Codex: Turn Complete!"
+            title = "%s Codex: Turn Complete!" % context_prefix
 
     elif normalized_type == "stop":
         # Claude Code: Stop hook (Claude finished responding)
@@ -430,13 +441,13 @@ def main():
                 if len(assistant_message) > 1500
                 else assistant_message
             )
-            title = "Claude Code: %s" % short_msg
+            title = "%s Claude Code:\n%s" % (context_prefix, short_msg)
         else:
-            title = "Claude Code: Turn Complete!"
+            title = "%s Claude Code: Turn Complete!" % context_prefix
 
     elif normalized_type == "subagent-stop":
         # Claude Code: SubagentStop hook
-        title = "Claude Code: Subagent Complete!"
+        title = "%s Claude Code: Subagent Complete!" % context_prefix
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
             message = assistant_message[:1500]
@@ -446,9 +457,9 @@ def main():
         notif_title = notification.get("title", "")
         notif_message = notification.get("message", "")
         if normalized_type == "permission-prompt":
-            title = "Claude Code: Permission Needed"
+            title = "%s Claude Code: Permission Needed" % context_prefix
         else:
-            title = "Claude Code: Waiting for Input"
+            title = "%s Claude Code: Waiting for Input" % context_prefix
         if notif_title:
             message = notif_title
         if notif_message:
