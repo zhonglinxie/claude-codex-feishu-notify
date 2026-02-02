@@ -8,7 +8,6 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import socket
-import subprocess
 import sys
 import time
 import traceback
@@ -212,68 +211,18 @@ def _get_context_info(notification: dict) -> dict:
     }
 
 
-def _get_codex_usage() -> dict:
-    """Try to get Codex usage/status information."""
-    try:
-        # Try running codex with a simple command to get usage info
-        # Codex typically shows usage in its output
-        result = subprocess.run(
-            ["codex", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        version = result.stdout.strip() if result.returncode == 0 else ""
-
-        # Try to read usage from auth.json or other config files
-        auth_file = Path.home() / ".codex" / "auth.json"
-        usage_info = {}
-        if auth_file.exists():
-            try:
-                auth_data = json.loads(auth_file.read_text())
-                # Extract relevant usage fields if they exist
-                if "usage" in auth_data:
-                    usage_info = auth_data["usage"]
-                elif "remaining" in auth_data:
-                    usage_info["remaining"] = auth_data["remaining"]
-            except Exception:
-                pass
-
-        return {"version": version, **usage_info}
-    except Exception as e:
-        LOGGER.debug("codex_usage_error: %r", e)
-        return {}
-
-
-def _format_context_line(ctx: dict, codex_usage: dict = None) -> str:
-    """Format context info as a single line for the notification."""
-    parts = []
-
-    # Host and user
-    host_user = "%s@%s" % (ctx.get("username", "?"), ctx.get("hostname", "?"))
-    parts.append(host_user)
-
-    # Working directory (shorten home)
+def _format_context_prefix(ctx: dict) -> str:
+    """Format context as prefix: user@host:path"""
+    username = ctx.get("username", "?")
+    hostname = ctx.get("hostname", "?")
     cwd = ctx.get("cwd", "")
+
+    # Shorten home directory
     home = str(Path.home())
     if cwd.startswith(home):
         cwd = "~" + cwd[len(home):]
-    if cwd:
-        parts.append(cwd)
 
-    # Codex usage if available
-    if codex_usage:
-        usage_parts = []
-        if codex_usage.get("version"):
-            usage_parts.append("v%s" % codex_usage["version"])
-        if "remaining" in codex_usage:
-            usage_parts.append("剩余: %s" % codex_usage["remaining"])
-        if "used" in codex_usage and "limit" in codex_usage:
-            usage_parts.append("%s/%s" % (codex_usage["used"], codex_usage["limit"]))
-        if usage_parts:
-            parts.append(" | ".join(usage_parts))
-
-    return " | ".join(parts)
+    return "%s@%s:%s" % (username, hostname, cwd)
 
 
 def _get_last_assistant_message(notification: dict) -> str:
@@ -479,53 +428,50 @@ def main():
 
     # Get context info (host, user, cwd)
     ctx = _get_context_info(notification)
-    codex_usage = None  # Only fetch for Codex notifications
-    is_codex = False
+    ctx_prefix = _format_context_prefix(ctx)
 
     if normalized_type == "agent-turn-complete":
         # Codex: agent turn complete
-        is_codex = True
-        codex_usage = _get_codex_usage()
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
             short_msg = (
-                assistant_message[:1200] + ".."
-                if len(assistant_message) > 1200
+                assistant_message[:1400] + ".."
+                if len(assistant_message) > 1400
                 else assistant_message
             )
-            title = "Codex: %s" % short_msg
+            title = "Codex@%s\n%s" % (ctx_prefix, short_msg)
         else:
-            title = "Codex: Turn Complete!"
+            title = "Codex@%s\nTurn Complete!" % ctx_prefix
 
     elif normalized_type == "stop":
         # Claude Code: Stop hook (Claude finished responding)
-        # Read last assistant message from transcript file
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
             short_msg = (
-                assistant_message[:1200] + ".."
-                if len(assistant_message) > 1200
+                assistant_message[:1400] + ".."
+                if len(assistant_message) > 1400
                 else assistant_message
             )
-            title = "Claude Code: %s" % short_msg
+            title = "Claude@%s\n%s" % (ctx_prefix, short_msg)
         else:
-            title = "Claude Code: Turn Complete!"
+            title = "Claude@%s\nTurn Complete!" % ctx_prefix
 
     elif normalized_type == "subagent-stop":
         # Claude Code: SubagentStop hook
-        title = "Claude Code: Subagent Complete!"
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
-            message = assistant_message[:1200]
+            title = "Claude@%s\nSubagent: %s" % (ctx_prefix, assistant_message[:1400])
+        else:
+            title = "Claude@%s\nSubagent Complete!" % ctx_prefix
 
     elif normalized_type in ("idle-prompt", "permission-prompt"):
         # Claude Code: Notification hook - needs user attention
         notif_title = notification.get("title", "")
         notif_message = notification.get("message", "")
         if normalized_type == "permission-prompt":
-            title = "Claude Code: Permission Needed"
+            title = "Claude@%s\n⚠️ Permission Needed" % ctx_prefix
         else:
-            title = "Claude Code: Waiting for Input"
+            title = "Claude@%s\n⏳ Waiting for Input" % ctx_prefix
         if notif_title:
             message = notif_title
         if notif_message:
@@ -535,11 +481,6 @@ def main():
         LOGGER.info("skip_notification type=%r hook_event=%r normalized=%r", notification_type, hook_event_name, normalized_type)
         print("Not sending a push notification for type:", notification_type or hook_event_name)
         return 0
-
-    # Add context line to message footer
-    context_line = _format_context_line(ctx, codex_usage if is_codex else None)
-    if context_line:
-        message = "%s\n\n📍 %s" % (message, context_line) if message else "📍 %s" % context_line
 
     try:
         send_feishu_dm(title, message, thread_id)
