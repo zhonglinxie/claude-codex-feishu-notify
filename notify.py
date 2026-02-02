@@ -249,7 +249,13 @@ def _read_last_assistant_from_transcript(transcript_path: str) -> str:
 
 
 def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
-    """Parse transcript and extract text from the last conversation turn."""
+    """Parse transcript and extract text from the last conversation turn.
+
+    Strategy: Find the last real user message, then collect all assistant text after it.
+    If no text found after the last user message, it means Stop hook fired before
+    the final assistant message was written - in that case, search backwards for
+    the most recent assistant text.
+    """
     lines = path.read_text(encoding="utf-8").strip().split("\n")
     LOGGER.info("transcript_read attempt=%d path=%s lines=%d", attempt, str(path), len(lines))
 
@@ -307,6 +313,30 @@ def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
                             all_text_parts.append(block.strip())
             elif isinstance(content, str) and content.strip():
                 all_text_parts.append(content.strip())
+
+    # If no text found after user message, search backwards for any recent assistant text
+    # This handles the case where Stop hook fires before final message is written
+    if not all_text_parts:
+        LOGGER.info("no_text_after_user_msg, searching backwards from_idx=%d", last_user_idx)
+        for i in range(last_user_idx - 1, max(0, last_user_idx - 50), -1):
+            line = lines[i].strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if entry.get("type") == "assistant":
+                message = entry.get("message", {})
+                content = message.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                LOGGER.info("found_previous_assistant_text at_idx=%d len=%d", i, len(text))
+                                return text
 
     if all_text_parts:
         result = "\n\n".join(all_text_parts)
