@@ -30,6 +30,22 @@ DEBUG_DUMP_JSON = os.getenv("CODEX_NOTIFY_DUMP_JSON", "").lower() in {
     "yes",
     "on",
 }
+
+# Claude Code hooks can be noisy. Tune behavior via env vars.
+# - `CODEX_NOTIFY_CLAUDE_IDLE_PROMPT=1` to send idle input prompts (disabled by default).
+# - `CODEX_NOTIFY_CLAUDE_EMPTY_STOP=1` to send Stop notifications even without assistant text.
+SEND_CLAUDE_IDLE_PROMPT = os.getenv("CODEX_NOTIFY_CLAUDE_IDLE_PROMPT", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SEND_CLAUDE_EMPTY_STOP = os.getenv("CODEX_NOTIFY_CLAUDE_EMPTY_STOP", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 # ==========================================
 
 
@@ -226,47 +242,70 @@ def _read_last_assistant_from_transcript(transcript_path: str) -> str:
     assistant messages until the next user message. We collect all text blocks from assistant
     messages in the last turn.
 
-    Waits for transcript to have new content by monitoring file size changes.
+    Strategy:
+    - Parse immediately (fast path; transcript is often already complete).
+    - If we see assistant entries after the last user message but no text blocks, it's likely a tool-use pause:
+      don't wait and return empty.
+    - If we see no assistant entries yet, wait briefly for the transcript to grow, then retry.
     """
     path = Path(transcript_path)
     if not path.exists():
         LOGGER.warning("transcript_not_found path=%s", transcript_path)
         return ""
 
-    # Get initial file size
-    initial_size = path.stat().st_size
-    initial_lines = len(path.read_text(encoding="utf-8").strip().split("\n"))
-    LOGGER.info("transcript_initial size=%d lines=%d", initial_size, initial_lines)
+    # Fast path: parse immediately (avoid waiting when transcript is already flushed).
+    last_size = path.stat().st_size
+    try:
+        result, has_assistant = _parse_transcript_for_last_turn(path, attempt=1)
+    except Exception as e:
+        LOGGER.warning("transcript_parse_error attempt=1 error=%r", e)
+        result, has_assistant = "", False
 
-    # Wait for file to grow (new content written)
-    max_wait = 8.0  # seconds
+    if result:
+        return result
+    if has_assistant:
+        # Tool-use stop: assistant wrote tool calls but no visible text; don't wait.
+        return ""
+
+    # Slow path: wait for the transcript to grow, then retry parsing.
+    max_wait = float(os.getenv("CODEX_NOTIFY_CLAUDE_TRANSCRIPT_WAIT", "8"))
     poll_interval = 0.3
     waited = 0.0
+    attempt = 1
     while waited < max_wait:
         time.sleep(poll_interval)
         waited += poll_interval
-        current_size = path.stat().st_size
-        if current_size > initial_size:
-            LOGGER.info("transcript_grew after=%.1fs old_size=%d new_size=%d", waited, initial_size, current_size)
-            # Give a tiny bit more time for write to complete
-            time.sleep(0.2)
-            break
 
-    # Now try to parse
-    for attempt in range(3):
         try:
-            result = _parse_transcript_for_last_turn(path, attempt + 1)
-            if result:
-                return result
-        except Exception as e:
-            LOGGER.warning("transcript_parse_error attempt=%d error=%r", attempt + 1, e)
-        time.sleep(0.5)
+            current_size = path.stat().st_size
+        except FileNotFoundError:
+            LOGGER.warning("transcript_not_found path=%s", transcript_path)
+            return ""
 
-    LOGGER.info("no_text_after_retries path=%s", transcript_path)
+        if current_size <= last_size:
+            continue
+
+        last_size = current_size
+        # Give a tiny bit more time for write to complete.
+        time.sleep(0.2)
+
+        attempt += 1
+        try:
+            result, has_assistant = _parse_transcript_for_last_turn(path, attempt=attempt)
+        except Exception as e:
+            LOGGER.warning("transcript_parse_error attempt=%d error=%r", attempt, e)
+            continue
+
+        if result:
+            return result
+        if has_assistant:
+            return ""
+
+    LOGGER.info("no_text_after_retries path=%s waited=%.1fs", transcript_path, waited)
     return ""
 
 
-def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
+def _parse_transcript_for_last_turn(path: Path, attempt: int) -> tuple[str, bool]:
     """Parse transcript and extract text from the last conversation turn.
 
     Strategy: Find the last real user message, then collect all assistant text after it.
@@ -304,9 +343,10 @@ def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
 
     if last_user_idx == -1:
         LOGGER.info("no_user_message_found path=%s", str(path))
-        return ""
+        return "", False
 
     # Collect all assistant text from last_user_idx to end
+    seen_assistant = False
     all_text_parts = []
     for i in range(last_user_idx + 1, len(lines)):
         line = lines[i].strip()
@@ -318,6 +358,7 @@ def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
             continue
 
         if entry.get("type") == "assistant":
+            seen_assistant = True
             message = entry.get("message", {})
             content = message.get("content", [])
             if isinstance(content, list):
@@ -335,10 +376,14 @@ def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
     if all_text_parts:
         result = "\n\n".join(all_text_parts)
         LOGGER.info("found_turn_text parts=%d len=%d preview=%r", len(all_text_parts), len(result), result[:100])
-        return result
+        return result, True
 
-    LOGGER.info("no_text_in_turn path=%s from_idx=%d attempt=%d", str(path), last_user_idx, attempt)
-    return ""
+    if seen_assistant:
+        LOGGER.info("no_text_in_turn path=%s from_idx=%d attempt=%d", str(path), last_user_idx, attempt)
+        return "", True
+
+    LOGGER.info("no_assistant_after_user path=%s from_idx=%d attempt=%d", str(path), last_user_idx, attempt)
+    return "", False
 
 
 def _normalize_notification_type(notification: dict) -> str:
@@ -467,6 +512,10 @@ def main():
             )
             title = "%s Claude Code:\n%s" % (context_prefix, short_msg)
         else:
+            # Claude Code fires Stop for tool-use pauses too; avoid spamming empty "complete" pings.
+            if not SEND_CLAUDE_EMPTY_STOP:
+                LOGGER.info("skip_stop_no_assistant_text thread_id=%r", thread_id)
+                return 0
             title = "%s Claude Code: Turn Complete!" % context_prefix
 
     elif normalized_type == "subagent-stop":
@@ -478,6 +527,9 @@ def main():
 
     elif normalized_type in ("idle-prompt", "permission-prompt"):
         # Claude Code: Notification hook - needs user attention
+        if normalized_type == "idle-prompt" and not SEND_CLAUDE_IDLE_PROMPT:
+            LOGGER.info("skip_idle_prompt thread_id=%r", thread_id)
+            return 0
         notif_title = notification.get("title", "")
         notif_message = notification.get("message", "")
         if normalized_type == "permission-prompt":

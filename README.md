@@ -45,7 +45,7 @@ echo '{"hook_event_name":"Stop","session_id":"test-123"}' | python3 ~/.codex/not
 ## 功能
 
 - **Stop Hook**: Claude 完成回复时发送通知（包含回复内容摘要）
-- **Notification Hook**: 需要用户输入或权限确认时发送通知
+- **Notification Hook**: 需要权限确认时发送通知（默认不推送“闲置输入提示”，可通过环境变量开启）
 
 ## 调试
 
@@ -53,6 +53,8 @@ echo '{"hook_event_name":"Stop","session_id":"test-123"}' | python3 ~/.codex/not
 |---------|------|
 | `CODEX_NOTIFY_DRY_RUN=1` | 不发送，只打印日志 |
 | `CODEX_NOTIFY_DUMP_JSON=1` | 保存收到的 JSON |
+| `CODEX_NOTIFY_CLAUDE_IDLE_PROMPT=1` | 发送 Claude Code 的闲置输入提示通知（默认关闭） |
+| `CODEX_NOTIFY_CLAUDE_EMPTY_STOP=1` | Stop 事件即使没有解析到回复文本也发送通知（默认关闭） |
 
 日志位置：`~/.codex/log/notify.log`
 
