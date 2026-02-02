@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import getpass
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-import socket
 import sys
 import time
 import traceback
@@ -197,34 +195,6 @@ def _get_thread_id(notification: dict) -> str:
     )
 
 
-def _get_context_info(notification: dict) -> dict:
-    """Get host, user, and working directory information."""
-    # Get from notification or fallback to system
-    cwd = notification.get("cwd") or os.getcwd()
-    hostname = socket.gethostname()
-    username = getpass.getuser()
-
-    return {
-        "hostname": hostname,
-        "username": username,
-        "cwd": cwd,
-    }
-
-
-def _format_context_prefix(ctx: dict) -> str:
-    """Format context as prefix: user@host:path"""
-    username = ctx.get("username", "?")
-    hostname = ctx.get("hostname", "?")
-    cwd = ctx.get("cwd", "")
-
-    # Shorten home directory
-    home = str(Path.home())
-    if cwd.startswith(home):
-        cwd = "~" + cwd[len(home):]
-
-    return "%s@%s:%s" % (username, hostname, cwd)
-
-
 def _get_last_assistant_message(notification: dict) -> str:
     # Codex: direct field
     msg = (
@@ -254,85 +224,96 @@ def _read_last_assistant_from_transcript(transcript_path: str) -> str:
     A conversation turn starts with a user message (not tool_result) and includes all subsequent
     assistant messages until the next user message. We collect all text blocks from assistant
     messages in the last turn.
+
+    Retries with increasing delay because Stop hook fires before transcript is fully written.
     """
-    try:
-        path = Path(transcript_path)
-        if not path.exists():
-            LOGGER.warning("transcript_not_found path=%s", transcript_path)
-            return ""
-
-        # Wait for transcript to be fully written (Stop hook fires before final write)
-        time.sleep(1.0)
-
-        # Read file and parse all lines
-        lines = path.read_text(encoding="utf-8").strip().split("\n")
-        LOGGER.info("transcript_read path=%s lines=%d", transcript_path, len(lines))
-
-        # Find the last user message that's not a tool_result (start of last turn)
-        last_user_idx = -1
-        for i in range(len(lines) - 1, -1, -1):
-            line = lines[i].strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if entry.get("type") == "user":
-                message = entry.get("message", {})
-                content = message.get("content", [])
-                # Check if it's a real user message (not tool_result)
-                if isinstance(content, str):
-                    last_user_idx = i
-                    break
-                elif isinstance(content, list):
-                    # If first item is tool_result, skip this
-                    if content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
-                        continue
-                    last_user_idx = i
-                    break
-
-        if last_user_idx == -1:
-            LOGGER.info("no_user_message_found path=%s", transcript_path)
-            return ""
-
-        # Collect all assistant text from last_user_idx to end
-        all_text_parts = []
-        for i in range(last_user_idx + 1, len(lines)):
-            line = lines[i].strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if entry.get("type") == "assistant":
-                message = entry.get("message", {})
-                content = message.get("content", [])
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                all_text_parts.append(text)
-                        elif isinstance(block, str):
-                            if block.strip():
-                                all_text_parts.append(block.strip())
-                elif isinstance(content, str) and content.strip():
-                    all_text_parts.append(content.strip())
-
-        if all_text_parts:
-            result = "\n\n".join(all_text_parts)
-            LOGGER.info("found_turn_text parts=%d len=%d preview=%r", len(all_text_parts), len(result), result[:100])
-            return result
-
-        LOGGER.info("no_text_in_turn path=%s from_idx=%d", transcript_path, last_user_idx)
+    path = Path(transcript_path)
+    if not path.exists():
+        LOGGER.warning("transcript_not_found path=%s", transcript_path)
         return ""
-    except Exception as e:
-        LOGGER.warning("transcript_read_error path=%s error=%r", transcript_path, e)
+
+    # Retry a few times with increasing delay
+    for attempt in range(4):
+        time.sleep(1.5 + attempt * 0.5)  # 1.5s, 2s, 2.5s, 3s
+
+        try:
+            result = _parse_transcript_for_last_turn(path, attempt + 1)
+            if result:
+                return result
+        except Exception as e:
+            LOGGER.warning("transcript_parse_error attempt=%d error=%r", attempt + 1, e)
+
+    LOGGER.info("no_text_after_retries path=%s", transcript_path)
+    return ""
+
+
+def _parse_transcript_for_last_turn(path: Path, attempt: int) -> str:
+    """Parse transcript and extract text from the last conversation turn."""
+    lines = path.read_text(encoding="utf-8").strip().split("\n")
+    LOGGER.info("transcript_read attempt=%d path=%s lines=%d", attempt, str(path), len(lines))
+
+    # Find the last user message that's not a tool_result (start of last turn)
+    last_user_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i].strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if entry.get("type") == "user":
+            message = entry.get("message", {})
+            content = message.get("content", [])
+            # Check if it's a real user message (not tool_result)
+            if isinstance(content, str):
+                last_user_idx = i
+                break
+            elif isinstance(content, list):
+                # If first item is tool_result, skip this
+                if content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
+                    continue
+                last_user_idx = i
+                break
+
+    if last_user_idx == -1:
+        LOGGER.info("no_user_message_found path=%s", str(path))
         return ""
+
+    # Collect all assistant text from last_user_idx to end
+    all_text_parts = []
+    for i in range(last_user_idx + 1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if entry.get("type") == "assistant":
+            message = entry.get("message", {})
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        if text:
+                            all_text_parts.append(text)
+                    elif isinstance(block, str):
+                        if block.strip():
+                            all_text_parts.append(block.strip())
+            elif isinstance(content, str) and content.strip():
+                all_text_parts.append(content.strip())
+
+    if all_text_parts:
+        result = "\n\n".join(all_text_parts)
+        LOGGER.info("found_turn_text parts=%d len=%d preview=%r", len(all_text_parts), len(result), result[:100])
+        return result
+
+    LOGGER.info("no_text_in_turn path=%s from_idx=%d attempt=%d", str(path), last_user_idx, attempt)
+    return ""
 
 
 def _normalize_notification_type(notification: dict) -> str:
@@ -426,52 +407,48 @@ def main():
         LOGGER.info("skip_stop_hook_active to prevent infinite loop")
         return 0
 
-    # Get context info (host, user, cwd)
-    ctx = _get_context_info(notification)
-    ctx_prefix = _format_context_prefix(ctx)
-
     if normalized_type == "agent-turn-complete":
         # Codex: agent turn complete
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
             short_msg = (
-                assistant_message[:1400] + ".."
-                if len(assistant_message) > 1400
+                assistant_message[:1500] + ".."
+                if len(assistant_message) > 1500
                 else assistant_message
             )
-            title = "Codex@%s\n%s" % (ctx_prefix, short_msg)
+            title = "Codex: %s" % short_msg
         else:
-            title = "Codex@%s\nTurn Complete!" % ctx_prefix
+            title = "Codex: Turn Complete!"
 
     elif normalized_type == "stop":
         # Claude Code: Stop hook (Claude finished responding)
+        # Read last assistant message from transcript file
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
             short_msg = (
-                assistant_message[:1400] + ".."
-                if len(assistant_message) > 1400
+                assistant_message[:1500] + ".."
+                if len(assistant_message) > 1500
                 else assistant_message
             )
-            title = "Claude@%s\n%s" % (ctx_prefix, short_msg)
+            title = "Claude Code: %s" % short_msg
         else:
-            title = "Claude@%s\nTurn Complete!" % ctx_prefix
+            title = "Claude Code: Turn Complete!"
 
     elif normalized_type == "subagent-stop":
         # Claude Code: SubagentStop hook
+        title = "Claude Code: Subagent Complete!"
         assistant_message = _get_last_assistant_message(notification)
         if assistant_message:
-            title = "Claude@%s\nSubagent: %s" % (ctx_prefix, assistant_message[:1400])
-        else:
-            title = "Claude@%s\nSubagent Complete!" % ctx_prefix
+            message = assistant_message[:1500]
 
     elif normalized_type in ("idle-prompt", "permission-prompt"):
         # Claude Code: Notification hook - needs user attention
         notif_title = notification.get("title", "")
         notif_message = notification.get("message", "")
         if normalized_type == "permission-prompt":
-            title = "Claude@%s\n⚠️ Permission Needed" % ctx_prefix
+            title = "Claude Code: Permission Needed"
         else:
-            title = "Claude@%s\n⏳ Waiting for Input" % ctx_prefix
+            title = "Claude Code: Waiting for Input"
         if notif_title:
             message = notif_title
         if notif_message:
